@@ -332,8 +332,7 @@ CoTask<void> FuseClients::ioRingWorker(int i, int ths) {
               }
             };
 
-        co_await job.ior->process(job.sqeProcTail,
-                                  job.toProc,
+        co_await job.ior->process(*job.sqes,
                                   *storageClient,
                                   config->storage_io(),
                                   userConfig,

@@ -16,7 +16,7 @@ std::vector<IoRingJob> IoRing::jobsToProc(int maxJobs) {
   std::vector<IoRingJob> jobs;
 
   std::lock_guard lock(cqeMtx_);
-  auto spt = sqeProcTail_;
+  auto spt = sqeTail.load();
   auto sqes = sqeCount();
 
   auto cqeAvail = entries - 1 - processing_ - cqeCount();
@@ -51,22 +51,26 @@ std::vector<IoRingJob> IoRing::jobsToProc(int maxJobs) {
       jobs.reserve(ioDepth ? std::min(maxJobs, sqes / abs(ioDepth) + 1) : 1);
     }
 
-    jobs.emplace_back(IoRingJob{shared_from_this(), spt, toProc});
+    auto jobSqes = std::make_shared<std::vector<IoSqe>>(toProc);
+    for (int i = 0; i < toProc; ++i) {
+      (*jobSqes)[i] = sqeSection[(spt + i) % entries];
+    }
+    jobs.emplace_back(IoRingJob{shared_from_this(), std::move(jobSqes)});
 
     spt = (spt + toProc) % entries;
-    sqeProcTails_.push_back(spt);
     processing_ += toProc;
     sqes -= toProc;
     cqeAvail -= toProc;
   }
 
-  sqeProcTail_ = spt;
+  // Jobs work on their own copies of the sqes, so the submitter can reuse these
+  // sqe slots now instead of after the jobs finish in submission order.
+  sqeTail = spt;
   return jobs;
 }
 
 CoTask<void> IoRing::process(
-    int spt,
-    int toProc,
+    const std::vector<IoSqe> &sqes,
     storage::client::StorageClient &storageClient,
     const storage::client::IoOptions &storageIo,
     UserConfig &userConfig,
@@ -92,6 +96,7 @@ CoTask<void> IoRing::process(
 
   auto &config = userConfig.getConfig(userInfo_);
 
+  int toProc = sqes.size();
   std::vector<ssize_t> res;
   if (!forRead_ && config.readonly()) {
     res = std::vector<ssize_t>(toProc, static_cast<ssize_t>(-StatusCode::kReadOnlyMode));
@@ -104,17 +109,11 @@ CoTask<void> IoRing::process(
 
     std::vector<std::shared_ptr<RcInode>> inodes;
     inodes.reserve(toProc);
-    lookupFiles(inodes, ringSection, sqeSection + spt, std::min(toProc, entries - spt));
-    if ((int)inodes.size() < toProc) {
-      lookupFiles(inodes, ringSection, sqeSection, toProc - (int)inodes.size());
-    }
+    lookupFiles(inodes, ringSection, sqes.data(), toProc);
 
     std::vector<Result<lib::ShmBufForIO>> bufs;
     bufs.reserve(toProc);
-    lookupBufs(bufs, ringSection, sqeSection + spt, std::min(toProc, entries - spt));
-    if ((int)bufs.size() < toProc) {
-      lookupBufs(bufs, ringSection, sqeSection, toProc - (int)bufs.size());
-    }
+    lookupBufs(bufs, ringSection, sqes.data(), toProc);
 
     lib::agent::PioV ioExec(storageClient, config.chunk_size_limit(), res);
     std::vector<uint64_t> truncateVers;
@@ -123,10 +122,7 @@ CoTask<void> IoRing::process(
     }
 
     for (int i = 0; i < toProc; ++i) {
-      auto idx = (spt + i) % entries;
-      auto sqe = sqeSection[idx];
-
-      const auto &args = ringSection[sqe.index];
+      const auto &args = ringSection[sqes[i].index];
 
       ++iod;
       totalBytes += args.ioLen;
@@ -212,50 +208,17 @@ CoTask<void> IoRing::process(
         if (!inode) {
           continue;
         }
-        auto sqe = sqeSection[(spt + i) % entries];
-        auto off = ringSection[sqe.index].fileOff;
+        auto off = ringSection[sqes[i].index].fileOff;
         auto r = res[i];
         inode->finishWrite(userInfo_.uid, truncateVers[i], off, r);
       }
     }
   }
 
-  auto newSpt = (spt + toProc) % entries;
-
-  std::vector<IoSqe> sqes(toProc);
-  for (int i = 0; i < toProc; ++i) {
-    sqes[i] = sqeSection[(spt + i) % entries];
-  }
-
   {
     // lock for between threads (io workers)
     // atomics for between processes (io worker & io generator)
     std::lock_guard lock(cqeMtx_);
-    if (sqeProcTails_.empty()) {
-      XLOGF(FATAL, "bug?! sqeProcTails_ is empty");
-    }
-
-    if (sqeProcTails_.front() != newSpt) {
-      sqeDoneTails_.insert(newSpt);
-    } else {
-      sqeTail = newSpt;
-      sqeProcTails_.pop_front();
-      while (!sqeDoneTails_.empty()) {
-        if (sqeProcTails_.empty()) {
-          XLOGF(FATAL, "bug?! sqeProcTails_ is empty");
-        }
-        auto first = sqeProcTails_.front();
-        auto it = sqeDoneTails_.find(first);
-        if (it == sqeDoneTails_.end()) {
-          break;
-        } else {
-          sqeTail = first;
-          sqeProcTails_.pop_front();
-          sqeDoneTails_.erase(it);
-        }
-      }
-    }
-
     for (int i = 0; i < toProc; ++i) {
       auto &sqe = sqes[i];
       auto r = res[i];

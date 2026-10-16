@@ -42,8 +42,8 @@ class IoRing;
 
 struct IoRingJob {
   std::shared_ptr<IoRing> ior;
-  int sqeProcTail;
-  int toProc;
+  // shared so that jobs stay nothrow copyable, which the job queues require
+  std::shared_ptr<const std::vector<IoSqe>> sqes;
 };
 
 // we allow multiple io workers to process the same ioring, but different ranges
@@ -121,8 +121,7 @@ class IoRing : public std::enable_shared_from_this<IoRing> {
   std::vector<IoRingJob> jobsToProc(int maxJobs);
   int cqeCount() const { return (cqeHead.load() + entries - cqeTail.load()) % entries; }
   CoTask<void> process(
-      int spt,
-      int toProc,
+      const std::vector<IoSqe> &sqes,
       storage::client::StorageClient &storageClient,
       const storage::client::IoOptions &storageIo,
       UserConfig &userConfig,
@@ -186,7 +185,7 @@ class IoRing : public std::enable_shared_from_this<IoRing> {
   AvailSlots slots;
 
  private:
-  int sqeCount() const { return (sqeHead.load() + entries - sqeProcTail_) % entries; }
+  int sqeCount() const { return (sqeHead.load() + entries - sqeTail.load()) % entries; }
   [[nodiscard]] bool addCqe(int idx, ssize_t res, const void *userdata) {
     auto h = cqeHead.load();
     if ((h + 1) % entries == cqeTail.load()) {
@@ -208,10 +207,7 @@ class IoRing : public std::enable_shared_from_this<IoRing> {
   bool forRead_;
   uint64_t flags_;
   std::mutex cqeMtx_;  // when reporting cqes
-  int sqeProcTail_{0};
   int processing_{0};
-  std::deque<int> sqeProcTails_;  // tails claimed and processing
-  std::set<int> sqeDoneTails_;    // tails done processing
 };
 
 struct IoRingTable {
